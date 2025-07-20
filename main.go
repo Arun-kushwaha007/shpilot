@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
-	"encoding/json"
 
 	"github.com/go-resty/resty/v2"
 	"github.com/spf13/cobra"
@@ -14,13 +14,13 @@ import (
 func main() {
 	var rootCmd = &cobra.Command{
 		Use:   "shpilot [query]",
-		Short: "shpilot suggests shell commands with AI",
+		Short: "shpilot suggests shell commands with AI (Gemini-powered)",
 		Args:  cobra.MinimumNArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			userInput := args[0]
 			fmt.Println("→ You typed:", userInput)
 
-			// Gather context
+			// Context: inside Git repo?
 			inGitRepo := false
 			out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output()
 			if err == nil && strings.TrimSpace(string(out)) == "true" {
@@ -30,7 +30,7 @@ func main() {
 				fmt.Println("→ Context: You are NOT inside a Git repository.")
 			}
 
-			// List files
+			// List current directory files
 			filesList := []string{}
 			entries, err := os.ReadDir(".")
 			if err == nil {
@@ -39,7 +39,7 @@ func main() {
 				}
 			}
 
-			// Check for Dockerfile
+			// Dockerfile check
 			dockerfileExists := false
 			if _, err := os.Stat("Dockerfile"); err == nil {
 				dockerfileExists = true
@@ -48,22 +48,18 @@ func main() {
 				fmt.Println("→ Context: No Dockerfile found.")
 			}
 
-			// Compose context message
+			// Compose prompt
 			contextMsg := fmt.Sprintf(
 				"User input: %s. Context: inside a Git repo = %t. Files: %s. Dockerfile present = %t.",
-				userInput,
-				inGitRepo,
-				strings.Join(filesList, ", "),
-				dockerfileExists,
+				userInput, inGitRepo, strings.Join(filesList, ", "), dockerfileExists,
 			)
 
-			// Send to OpenAI
-			suggestion, err := getAISuggestion(contextMsg)
+			// Call Gemini API
+			suggestion, err := getGeminiSuggestion(contextMsg)
 			if err != nil {
 				fmt.Println("Error contacting AI:", err)
 				return
 			}
-
 			fmt.Println("→ AI Suggestion:", suggestion)
 		},
 	}
@@ -74,54 +70,60 @@ func main() {
 	}
 }
 
-func getAISuggestion(prompt string) (string, error) {
-	apiKey := os.Getenv("OPENAI_API_KEY")
+func getGeminiSuggestion(prompt string) (string, error) {
+	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		return "", fmt.Errorf("OPENAI_API_KEY not set")
+		return "", fmt.Errorf("GEMINI_API_KEY not set")
 	}
 
 	client := resty.New()
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + apiKey
+
+	requestBody := map[string]interface{}{
+		"contents": []map[string]interface{}{
+			{
+				"parts": []map[string]string{
+					{"text": "You are a helpful assistant that suggests accurate shell commands based on input and context."},
+				},
+				"role": "user",
+			},
+			{
+				"parts": []map[string]string{
+					{"text": prompt},
+				},
+				"role": "user",
+			},
+		},
+	}
+
 	resp, err := client.R().
 		SetHeader("Content-Type", "application/json").
-		SetHeader("Authorization", "Bearer "+apiKey).
-		SetBody(map[string]interface{}{
-			"model": "gpt-3.5-turbo",
-			"messages": []map[string]string{
-				{
-					"role":    "system",
-					"content": "You are a shell command assistant. Suggest correct shell commands based on user input and context. Keep answers concise.",
-				},
-				{
-					"role":    "user",
-					"content": prompt,
-				},
-			},
-		}).
-		Post("https://api.openai.com/v1/chat/completions")
+		SetBody(requestBody).
+		Post(url)
 
 	if err != nil {
 		return "", err
 	}
 
-	type Choice struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
+	var result struct {
+		Candidates []struct {
+			Content struct {
+				Parts []struct {
+					Text string `json:"text"`
+				} `json:"parts"`
+			} `json:"content"`
+		} `json:"candidates"`
 	}
 
-	type OpenAIResponse struct {
-		Choices []Choice `json:"choices"`
-	}
-
-	var aiResp OpenAIResponse
 	fmt.Println("→ Raw AI response body:", resp.String())
-	err = json.Unmarshal(resp.Body(), &aiResp)
+
+	err = json.Unmarshal(resp.Body(), &result)
 	if err != nil {
 		return "", err
 	}
 
-	if len(aiResp.Choices) > 0 {
-		return aiResp.Choices[0].Message.Content, nil
+	if len(result.Candidates) > 0 && len(result.Candidates[0].Content.Parts) > 0 {
+		return result.Candidates[0].Content.Parts[0].Text, nil
 	}
 
 	return "No suggestion available.", nil
