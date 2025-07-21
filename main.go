@@ -12,6 +12,8 @@ import (
 )
 
 func main() {
+	var showRaw bool
+
 	var rootCmd = &cobra.Command{
 		Use:   "shpilot [query]",
 		Short: "shpilot suggests shell commands with AI (Gemini-powered)",
@@ -20,78 +22,89 @@ func main() {
 			userInput := args[0]
 			fmt.Println("→ You typed:", userInput)
 
-			// Context: inside Git repo?
+			// Context detection
 			inGitRepo := false
-			out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output()
-			if err == nil && strings.TrimSpace(string(out)) == "true" {
+			if out, err := exec.Command("git", "rev-parse", "--is-inside-work-tree").Output(); err == nil &&
+				strings.TrimSpace(string(out)) == "true" {
 				inGitRepo = true
-				fmt.Println("→ Context: You are inside a Git repository.")
-			} else {
-				fmt.Println("→ Context: You are NOT inside a Git repository.")
+				fmt.Println("→ Context: Inside a Git repo.")
 			}
 
-			// List current directory files
 			filesList := []string{}
-			entries, err := os.ReadDir(".")
-			if err == nil {
+			if entries, err := os.ReadDir("."); err == nil {
 				for _, entry := range entries {
 					filesList = append(filesList, entry.Name())
 				}
 			}
 
-			// Dockerfile check
 			dockerfileExists := false
 			if _, err := os.Stat("Dockerfile"); err == nil {
 				dockerfileExists = true
-				fmt.Println("→ Context: Found Dockerfile.")
-			} else {
-				fmt.Println("→ Context: No Dockerfile found.")
+				fmt.Println("→ Context: Dockerfile found.")
 			}
 
-			// Compose prompt
-			contextMsg := fmt.Sprintf(
-				"User input: %s. Context: inside a Git repo = %t. Files: %s. Dockerfile present = %t.",
-				userInput, inGitRepo, strings.Join(filesList, ", "), dockerfileExists,
-			)
+			// Prompt
+			contextMsg := fmt.Sprintf(`You are a shell assistant. 
+User input: "%s"
+Context:
+- In Git repo: %t
+- Files: %s
+- Dockerfile: %t
 
-			// Call Gemini API
-			suggestion, err := getGeminiSuggestion(contextMsg)
+Respond strictly in JSON with:
+{
+  "command": "shell command",
+  "description": "what it does",
+  "notes": "optional tips or edge cases"
+}`,
+				userInput, inGitRepo, strings.Join(filesList, ", "), dockerfileExists)
+
+			// Get AI response
+			suggestion, rawText, err := getGeminiSuggestion(contextMsg)
 			if err != nil {
-				fmt.Println("Error contacting AI:", err)
+				fmt.Println("❌ Error:", err)
 				return
 			}
-			fmt.Println("→ AI Suggestion:", suggestion)
+
+			// Output
+			fmt.Println("✅ AI Suggestion:")
+			fmt.Println("🔹 Command    :", suggestion.Command)
+			fmt.Println("🔹 Description:", suggestion.Description)
+			fmt.Println("🔹 Notes      :", suggestion.Notes)
+			if showRaw {
+				fmt.Println("\n📝 Raw response:\n", rawText)
+			}
 		},
 	}
 
+	rootCmd.Flags().BoolVar(&showRaw, "raw", false, "Show raw Gemini output")
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 }
 
-func getGeminiSuggestion(prompt string) (string, error) {
+type StructuredSuggestion struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+	Notes       string `json:"notes"`
+}
+
+func getGeminiSuggestion(prompt string) (StructuredSuggestion, string, error) {
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		return "", fmt.Errorf("GEMINI_API_KEY not set")
+		return StructuredSuggestion{}, "", fmt.Errorf("GEMINI_API_KEY not set")
 	}
 
 	client := resty.New()
-	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=" + apiKey
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + apiKey
 
 	requestBody := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
 				"parts": []map[string]string{
-					{"text": "You are a helpful assistant that suggests accurate shell commands based on input and context."},
-				},
-				"role": "user",
-			},
-			{
-				"parts": []map[string]string{
 					{"text": prompt},
 				},
-				"role": "user",
 			},
 		},
 	}
@@ -102,7 +115,7 @@ func getGeminiSuggestion(prompt string) (string, error) {
 		Post(url)
 
 	if err != nil {
-		return "", err
+		return StructuredSuggestion{}, "", err
 	}
 
 	var result struct {
@@ -115,16 +128,33 @@ func getGeminiSuggestion(prompt string) (string, error) {
 		} `json:"candidates"`
 	}
 
-	fmt.Println("→ Raw AI response body:", resp.String())
-
 	err = json.Unmarshal(resp.Body(), &result)
 	if err != nil {
-		return "", err
+		return StructuredSuggestion{}, "", err
 	}
 
 	if len(result.Candidates) > 0 && len(result.Candidates[0].Content.Parts) > 0 {
-		return result.Candidates[0].Content.Parts[0].Text, nil
+		rawText := result.Candidates[0].Content.Parts[0].Text
+
+		// Strip markdown code block if present
+		rawText = strings.TrimSpace(rawText)
+		if strings.HasPrefix(rawText, "```json") {
+			rawText = strings.TrimPrefix(rawText, "```json")
+		} else if strings.HasPrefix(rawText, "```") {
+			rawText = strings.TrimPrefix(rawText, "```")
+		}
+		if strings.HasSuffix(rawText, "```") {
+			rawText = strings.TrimSuffix(rawText, "```")
+		}
+
+		// Unmarshal into the structured format
+		var suggestion StructuredSuggestion
+		err = json.Unmarshal([]byte(rawText), &suggestion)
+		if err != nil {
+			return StructuredSuggestion{}, rawText, fmt.Errorf("failed to parse AI response as structured JSON: %v\nRaw response:\n%s", err, rawText)
+		}
+		return suggestion, rawText, nil
 	}
 
-	return "No suggestion available.", nil
+	return StructuredSuggestion{}, "", fmt.Errorf("no suggestion available")
 }
