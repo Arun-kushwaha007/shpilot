@@ -59,14 +59,13 @@ Respond strictly in JSON with:
 }`,
 				userInput, inGitRepo, strings.Join(filesList, ", "), dockerfileExists)
 
-			// Get AI response
 			suggestion, rawText, err := getGeminiSuggestion(contextMsg)
 			if err != nil {
 				fmt.Println("❌ Error:", err)
 				return
 			}
 
-			// Output
+		
 			fmt.Println("✅ AI Suggestion:")
 			fmt.Println("🔹 Command    :", suggestion.Command)
 			fmt.Println("🔹 Description:", suggestion.Description)
@@ -136,7 +135,7 @@ func getGeminiSuggestion(prompt string) (StructuredSuggestion, string, error) {
 	if len(result.Candidates) > 0 && len(result.Candidates[0].Content.Parts) > 0 {
 		rawText := result.Candidates[0].Content.Parts[0].Text
 
-		// Strip markdown code block if present
+	
 		rawText = strings.TrimSpace(rawText)
 		if strings.HasPrefix(rawText, "```json") {
 			rawText = strings.TrimPrefix(rawText, "```json")
